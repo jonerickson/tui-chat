@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Console\Commands;
 
 use App\Models\Room;
@@ -12,6 +14,7 @@ use React\Socket\Connection;
 use React\Socket\Connector;
 use React\Stream\ReadableResourceStream;
 use Symfony\Component\Console\Attribute\AsCommand;
+use Throwable;
 
 use function Laravel\Prompts\search;
 
@@ -22,9 +25,9 @@ class StartClient extends Command implements PromptsForMissingInput
 
     protected $description = 'Start the TUI chat client';
 
-    private string $username;
+    private ?string $username;
 
-    private string $room;
+    private ?string $room;
 
     private Connection $connection;
 
@@ -34,40 +37,55 @@ class StartClient extends Command implements PromptsForMissingInput
 
     private bool $isConnected = false;
 
-    public function handle()
+    private string $inputBuffer = '';
+
+    private int $terminalHeight = 24;
+
+    private int $terminalWidth = 80;
+
+    public function handle(): int
     {
         $this->username = $this->argument('username');
-        $this->room = Room::whereKey($this->argument('room'))->orWhere('slug', $this->argument('room'))->firstOrFail()->slug;
+        $this->room = Room::whereKey($this->argument('room'))->orWhere('slug', $this->argument('room'))->value('slug');
+
+        if (is_null($this->room)) {
+            $this->components->error('The room you provided does not exist. Please provide a valid room.');
+
+            return self::FAILURE;
+        }
+
         $server = $this->option('server');
 
-        if (empty($this->username)) {
-            $this->error('Username is required!');
+        if (is_null($this->username)) {
+            $this->components->error('Please provide a valid username.');
 
-            return 1;
+            return self::FAILURE;
         }
 
         $loop = Loop::get();
 
-        $this->setupTerminal();
-
         $connector = new Connector($loop);
 
-        $this->info("🔌 Connecting to server at $server...");
+        $this->components->info("Connecting to server at $server...");
 
-        $connector->connect("tcp://{$server}")
+        $connector->connect("tcp://$server")
             ->then(function ($connection) use ($loop) {
                 $this->connection = $connection;
                 $this->isConnected = true;
+                $this->setupTerminal();
                 $this->setupConnection($connection, $loop);
                 $this->joinRoom();
             })
-            ->otherwise(function ($error) {
-                $this->error('❌ Failed to connect to server: '.$error->getMessage());
-                $this->error('Make sure the server is running with: php artisan chat:server');
-                exit(1);
+            ->catch(function (Throwable $error) {
+                $this->components->error('Failed to connect to server: '.$error->getMessage());
+                $this->components->info('Make sure the chat server has been started using the command: <info>php artisan chat:server</info>');
+
+                return self::FAILURE;
             });
 
         $loop->run();
+
+        return self::SUCCESS;
     }
 
     protected function promptForMissingArgumentsUsing(): array
@@ -86,44 +104,94 @@ class StartClient extends Command implements PromptsForMissingInput
 
     private function setupTerminal(): void
     {
-        system('stty -echo');
-        system('clear');
+        system('stty -icanon -echo');
 
-        if (function_exists('pcntl_signal')) {
-            pcntl_signal(SIGINT, function () {
-                $this->cleanup();
-                exit(0);
-            });
+        $size = explode(' ', shell_exec('stty size') ?? '24 80');
+        $this->terminalHeight = (int) ($size[0] ?? 24);
+        $this->terminalWidth = (int) ($size[1] ?? 80);
 
-            pcntl_signal(SIGTERM, function () {
-                $this->cleanup();
-                exit(0);
-            });
+        $this->trap([SIGINT, SIGTERM], function () {
+            $this->cleanup();
+            exit(0);
+        });
+
+        $this->redrawScreen();
+    }
+
+    private function redrawScreen(): void
+    {
+        // Move cursor to home position and clear screen
+        echo "\033[H\033[J";
+
+        // Draw header
+        $title = '🗨️  TUI Chat Client';
+        $subtitle = "Room: #{$this->room} | User: {$this->username}";
+
+        echo str_repeat('═', $this->terminalWidth).PHP_EOL;
+        echo center($title, $this->terminalWidth).PHP_EOL;
+        echo center($subtitle, $this->terminalWidth).PHP_EOL;
+        echo str_repeat('═', $this->terminalWidth).PHP_EOL;
+
+        // Calculate how many lines we have for messages
+        // Header = 4 lines, Input area = 3 lines (separator, input, hint)
+        $messageLines = $this->terminalHeight - 7;
+
+        // Display messages
+        $messagesToShow = array_slice($this->messages, -$messageLines);
+        foreach ($messagesToShow as $message) {
+            $this->renderMessage($message);
         }
 
-        $this->displayHeader();
+        // Fill remaining space with blank lines
+        $blankLines = $messageLines - count($messagesToShow);
+        for ($i = 0; $i < $blankLines; $i++) {
+            echo PHP_EOL;
+        }
+
+        // Draw input area separator
+        $separatorLine = $this->terminalHeight - 2;
+        echo "\033[$separatorLine;1H".str_repeat('─', $this->terminalWidth);
+
+        // Draw hint line
+        $hintLine = $this->terminalHeight - 1;
+        $hint = 'Press Enter to send • /help for commands';
+        echo "\033[$hintLine;1H".center($hint, $this->terminalWidth);
+
+        // Position cursor at the start of the last line and draw input box
+        echo "\033[$this->terminalHeight;1HMessage: ".$this->inputBuffer;
+
+        // Move cursor to the correct position (last line, after "Message: " + buffer)
+        $cursorColumn = 10 + mb_strlen($this->inputBuffer); // "Message: " is 9 chars + space
+        echo "\033[{$this->terminalHeight};{$cursorColumn}H";
+
+        // Ensure output is flushed
+        flush();
     }
 
-    private function displayHeader(): void
+    private function renderMessage(array $message): void
     {
-        $width = 80;
-        $title = '🗨️  TUI Chat Client';
-        $subtitle = "Room: #$this->room | User: $this->username";
+        $timestamp = $message['timestamp'] ?? date('H:i:s');
+        $username = $message['username'] ?? 'Unknown';
+        $content = $message['message'] ?? '';
+        $type = $message['type'] ?? 'chat';
+        $isOwn = ($message['_isOwn'] ?? false);
 
-        $this->line(str_repeat('═', $width));
-        $this->line($this->centerText($title, $width));
-        $this->line($this->centerText($subtitle, $width));
-        $this->line(str_repeat('═', $width));
-        $this->line('Commands: /quit to exit, /clear to clear screen, /help for help');
-        $this->line(str_repeat('-', $width));
-        $this->line('');
-    }
+        switch ($type) {
+            case 'system':
+                echo "🔔 [$timestamp] $content".PHP_EOL;
+                break;
 
-    private function centerText($text, $width)
-    {
-        $padding = ($width - strlen($text)) / 2;
+            case 'chat':
+                if ($isOwn) {
+                    echo "📤 [$timestamp] You: $content".PHP_EOL;
+                } else {
+                    echo "💬 [$timestamp] $username: {$content}".PHP_EOL;
+                }
+                break;
 
-        return str_repeat(' ', floor($padding)).$text.str_repeat(' ', ceil($padding));
+            default:
+                echo "📨 [$timestamp] $username: $content".PHP_EOL;
+        }
     }
 
     private function setupConnection(Connection $connection, LoopInterface $loop): void
@@ -139,7 +207,8 @@ class StartClient extends Command implements PromptsForMissingInput
 
         $connection->on('close', function () {
             $this->isConnected = false;
-            $this->error(PHP_EOL.'❌ Connection to server lost!');
+            $this->newLine();
+            $this->components->error('Connection to the server closed.');
             $this->cleanup();
             exit(1);
         });
@@ -157,24 +226,23 @@ class StartClient extends Command implements PromptsForMissingInput
     private function setupInput(LoopInterface $loop): void
     {
         $stdin = new ReadableResourceStream(STDIN, $loop);
-        $inputBuffer = '';
 
-        $stdin->on('data', function ($data) use (&$inputBuffer) {
+        $stdin->on('data', function ($data) {
             $char = $data;
 
             if ($char === "\n" || $char === "\r") {
                 // Enter pressed - send message
-                if (! empty(trim($inputBuffer))) {
-                    $this->handleUserInput(trim($inputBuffer));
+                if (! empty(trim($this->inputBuffer))) {
+                    $this->handleUserInput(trim($this->inputBuffer));
                 }
-                $inputBuffer = '';
-                $this->displayPrompt();
+                $this->inputBuffer = '';
+                $this->redrawScreen();
 
             } elseif ($char === "\x7f" || $char === "\x08") {
                 // Backspace pressed
-                if (strlen($inputBuffer) > 0) {
-                    $inputBuffer = substr($inputBuffer, 0, -1);
-                    echo "\x08 \x08"; // Move back, print space, move back again
+                if (strlen($this->inputBuffer) > 0) {
+                    $this->inputBuffer = substr($this->inputBuffer, 0, -1);
+                    $this->redrawScreen();
                 }
 
             } elseif ($char === "\x03") {
@@ -184,17 +252,10 @@ class StartClient extends Command implements PromptsForMissingInput
 
             } elseif (ord($char) >= 32 && ord($char) <= 126) {
                 // Printable character
-                $inputBuffer .= $char;
-                echo $char;
+                $this->inputBuffer .= $char;
+                $this->redrawScreen();
             }
         });
-
-        $this->displayPrompt();
-    }
-
-    private function displayPrompt(): void
-    {
-        echo PHP_EOL.'> ';
     }
 
     private function handleUserInput(string $input): void
@@ -219,53 +280,62 @@ class StartClient extends Command implements PromptsForMissingInput
                 exit(0);
 
             case '/clear':
-                system('clear');
-                $this->displayHeader();
-                $this->redisplayMessages();
+                $this->messages = [];
+                $this->redrawScreen();
                 break;
 
             case '/help':
-                $this->displayHelp();
+                $this->displayMessage([
+                    'type' => 'system',
+                    'message' => "\n\nAvailable Commands:\n/quit, /exit - Leave the chat\n/clear - Clear message history\n/room [name] - Change room or show current room\n/help - Show this help\n",
+                    'timestamp' => date('H:i:s'),
+                ]);
                 break;
 
             case '/room':
                 if (isset($parts[1])) {
                     $this->changeRoom(trim($parts[1]));
                 } else {
-                    $this->line("Current room: {$this->room}");
+                    $this->displayMessage([
+                        'type' => 'system',
+                        'message' => "Current room: {$this->room}",
+                        'timestamp' => date('H:i:s'),
+                    ]);
                 }
                 break;
 
             default:
-                $this->line("Unknown command: {$cmd}. Type /help for available commands.");
+                $this->displayMessage([
+                    'type' => 'system',
+                    'message' => "Unknown command: {$cmd}. Type /help for available commands.",
+                    'timestamp' => date('H:i:s'),
+                ]);
         }
-    }
-
-    private function displayHelp(): void
-    {
-        $this->line(PHP_EOL.'📋 Available Commands:');
-        $this->line('  /quit, /exit    - Leave the chat');
-        $this->line('  /clear          - Clear the screen');
-        $this->line('  /room [name]    - Change room or show current room');
-        $this->line('  /help           - Show this help message');
-        $this->line('');
     }
 
     private function changeRoom(string $newRoom): void
     {
         if ($newRoom === $this->room) {
-            $this->line("You're already in room '{$newRoom}'");
+            $this->displayMessage([
+                'type' => 'system',
+                'message' => "You're already in room '{$newRoom}'",
+                'timestamp' => date('H:i:s'),
+            ]);
 
             return;
         }
 
         $this->sendLeaveMessage();
         $this->room = $newRoom;
+        $this->messages = [];
         $this->joinRoom();
+        $this->redrawScreen();
 
-        system('clear');
-        $this->displayHeader();
-        $this->line("🚪 Switched to room '{$newRoom}'");
+        $this->displayMessage([
+            'type' => 'system',
+            'message' => "Switched to room '{$newRoom}'",
+            'timestamp' => date('H:i:s'),
+        ]);
     }
 
     private function joinRoom(): void
@@ -353,60 +423,28 @@ class StartClient extends Command implements PromptsForMissingInput
 
     private function displayMessage(array $message, bool $isOwn = false): void
     {
+        if ($isOwn) {
+            $message['_isOwn'] = true;
+        }
+
         $this->messages[] = $message;
 
         if (count($this->messages) > $this->maxMessages) {
             $this->messages = array_slice($this->messages, -$this->maxMessages);
         }
 
-        echo "\r".str_repeat(' ', 80)."\r";
-
-        $timestamp = $message['timestamp'] ?? date('H:i:s');
-        $username = $message['username'] ?? 'Unknown';
-        $content = $message['message'] ?? '';
-        $type = $message['type'] ?? 'chat';
-
-        switch ($type) {
-            case 'system':
-                $this->line("🔔 [$timestamp] $content");
-                break;
-
-            case 'chat':
-                if ($isOwn) {
-                    $this->line("📤 [$timestamp] You: $content");
-                } else {
-                    $this->line("💬 [$timestamp] $username: $content");
-                }
-                break;
-
-            default:
-                $this->line("📨 [$timestamp] $username: $content");
-        }
-
-        $this->displayPrompt();
-    }
-
-    private function redisplayMessages(): void
-    {
-        foreach ($this->messages as $message) {
-            $this->displayMessage($message);
-        }
+        $this->redrawScreen();
     }
 
     private function cleanup(): void
     {
-        system('stty echo');
+        system('stty icanon echo');
 
         if ($this->isConnected) {
             $this->sendLeaveMessage();
             $this->connection->close();
         }
 
-        $this->line(PHP_EOL.'👋 Goodbye!');
-    }
-
-    public function __destruct()
-    {
-        $this->cleanup();
+        $this->components->info('👋 Goodbye!');
     }
 }

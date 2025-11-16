@@ -1,5 +1,7 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Models;
 
 use Illuminate\Database\Eloquent\Model;
@@ -10,9 +12,10 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @property int $room_id
  * @property string $username
  * @property string $content
- * @property string $sent_at
+ * @property \Illuminate\Support\Carbon $sent_at
  * @property \Illuminate\Support\Carbon|null $created_at
  * @property \Illuminate\Support\Carbon|null $updated_at
+ * @property-read Room $room
  *
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Message newModelQuery()
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Message newQuery()
@@ -24,8 +27,6 @@ use Illuminate\Database\Eloquent\Relations\BelongsTo;
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Message whereSentAt($value)
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Message whereUpdatedAt($value)
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Message whereUsername($value)
- *
- * @property-read \App\Models\Room $room
  *
  * @mixin \Eloquent
  */

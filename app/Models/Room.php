@@ -1,7 +1,10 @@
 <?php
 
+declare(strict_types=1);
+
 namespace App\Models;
 
+use Illuminate\Database\Eloquent\Factories\HasFactory;
 use Illuminate\Database\Eloquent\Model;
 
 /**
@@ -11,6 +14,7 @@ use Illuminate\Database\Eloquent\Model;
  * @property \Illuminate\Support\Carbon|null $created_at
  * @property \Illuminate\Support\Carbon|null $updated_at
  *
+ * @method static \Database\Factories\RoomFactory factory($count = null, $state = [])
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Room newModelQuery()
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Room newQuery()
  * @method static \Illuminate\Database\Eloquent\Builder<static>|Room query()
@@ -24,6 +28,8 @@ use Illuminate\Database\Eloquent\Model;
  */
 class Room extends Model
 {
+    use HasFactory;
+
     protected $fillable = [
         'name',
         'slug',
